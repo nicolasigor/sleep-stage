@@ -1,5 +1,3 @@
-# TODO: Adaptarlo para leer los canales de interes y el hipnograma y los metodos deseados
-
 """Class definition to manipulate data spindle EEG datasets."""
 
 from __future__ import absolute_import
@@ -8,10 +6,13 @@ from __future__ import print_function
 
 import os
 import pickle
+import time
 
 import numpy as np
+import pyedflib
 
 from . import utils
+from libs.common import checks
 
 KEY_EEG_FRONTAL = 'frontal'
 KEY_EEG_CENTRAL = 'central'
@@ -21,25 +22,18 @@ KEY_EOG_LEFT = 'eog_left'
 KEY_EOG_RIGHT = 'eog_right'
 KEY_HYPNOGRAM = 'hypnogram'
 
-
 PATH_MASS_RELATIVE = 'mass'
 PATH_REC = 'register'
-PATH_MARKS = os.path.join('label', 'spindle')
-PATH_STATES = os.path.join('label', 'state')
+PATH_STATES = 'state'
 
 KEY_FILE_EEG = 'file_eeg'
 KEY_FILE_STATES = 'file_states'
-KEY_FILE_MARKS = 'file_marks'
 
-IDS_INVALID = [4, 8, 15, 16]
 IDS_TEST = [2, 6, 12, 13]
-# IDS_INVALID = []
-# IDS_TEST = [2, 6, 12, 13, 4, 8, 15, 16]
-
 
 
 class Mass(object):
-    """This is a class to manipulate the MASS data EEG dataset.
+    """This is a class to manipulate the MASS dataset.
 
     Expected directory tree inside DATA folder (see utils.py):
 
@@ -51,13 +45,6 @@ class Mass(object):
     |__ PATH_STATES
         |__ 01-02-0001 Base.edf
         |__ 01-02-0002 Base.edf
-        |__ ...
-    |__ PATH_MARKS
-        |__ 01-02-0001 SpindleE1.edf
-        |__ 01-02-0002 SpindleE1.edf
-        |__ ...
-        |__ 01-02-0001 SpindleE2.edf
-        |__ 01-02-0002 SpindleE2.edf
         |__ ...
     """
 
@@ -72,482 +59,42 @@ class Mass(object):
             load_checkpoint: (Boolean). Whether to load from a checkpoint or to
                load from scratch using the original files of the dataset.
         """
-        # MASS parameters
-        self.channel = 'EEG C3-CLE'  # Channel for SS marks
-        # In MASS, we need to index by name since not all the lists are
-        # sorted equally
-
-        # Hypnogram parameters
-        self.state_ids = np.array(['1', '2', '3', '4', 'R', 'W', '?'])
-        self.unknown_id = '?'  # Character for unknown state in hypnogram
-        self.n2_id = '2'  # Character for N2 identification in hypnogram
-
-        # Sleep spindles characteristics
-        self.min_ss_duration = 0.3  # Minimum duration of SS in seconds
-        self.max_ss_duration = 3  # Maximum duration of SS in seconds
-
-        valid_ids = [i for i in range(1, 20) if i not in IDS_INVALID]
+        self.dataset_name = 'mass'
+        valid_ids = [i for i in range(1, 20)]
         self.test_ids = IDS_TEST
         self.train_ids = [i for i in valid_ids if i not in self.test_ids]
+        self.all_ids = self.train_ids + self.test_ids
+        self.all_ids.sort()
+        if verbose:
+            print('Dataset %s with %d patients.'
+                  % (self.dataset_name, len(self.all_ids)))
+            print('Train size: %d. Test size: %d'
+                  % (len(self.train_ids), len(self.test_ids)))
+            print('Train subjects: \n', self.train_ids)
+            print('Test subjects: \n', self.test_ids)
 
-        print('Train size: %d. Test size: %d'
-              % (len(self.train_ids), len(self.test_ids)))
-        print('Train subjects: \n', self.train_ids)
-        print('Test subjects: \n', self.test_ids)
-
+        self.fs = 256  # Original sampling frequency [Hz]
+        self.page_duration = 20  # Time of window page [s]
 
         # Save attributes
+        dataset_dir = os.path.join(utils.PATH_DATA, PATH_MASS_RELATIVE)
         if os.path.isabs(dataset_dir):
             self.dataset_dir = dataset_dir
         else:
             self.dataset_dir = os.path.abspath(
                 os.path.join(utils.PATH_DATA, dataset_dir))
         # We verify that the directory exists
-        checks.check_directory(self.dataset_dir)
+        if not load_checkpoint:
+            checks.check_directory(self.dataset_dir)
 
         self.load_checkpoint = load_checkpoint
-        self.dataset_name = dataset_name
-        self.event_name = event_name
-        self.n_experts = n_experts
         self.ckpt_dir = os.path.abspath(os.path.join(
             self.dataset_dir, '..', 'ckpt_%s' % self.dataset_name))
         self.ckpt_file = os.path.join(
             self.ckpt_dir, '%s.pickle' % self.dataset_name)
-        self.all_ids = all_ids
-        self.all_ids.sort()
-        if verbose:
-            print('Dataset %s with %d patients.'
-                  % (self.dataset_name, len(self.all_ids)))
-
-        # events and data EEG related parameters
-        self.params = pkeys.default_params.copy()
-        if params is not None:
-            self.params.update(params)  # Overwrite defaults
-
-        # Sampling frequency [Hz] to be used (not the original)
-        self.fs = self.params[pkeys.FS]
-        # Time of window page [s]
-        self.page_duration = self.params[pkeys.PAGE_DURATION]
-        self.page_size = int(self.page_duration * self.fs)
 
         # Data loading
         self.data = self._load_data(verbose=verbose)
-        self.global_std = 1.0
-
-
-    def get_subject_signal(
-            self,
-            subject_id,
-            normalize_clip=True,
-            normalization_mode=constants.WN_RECORD,
-            which_expert=1,
-            verbose=False
-    ):
-        checks.check_valid_value(subject_id, 'ID', self.all_ids)
-        valid_experts = [(i + 1) for i in range(self.n_experts)]
-        checks.check_valid_value(which_expert, 'which_expert', valid_experts)
-        checks.check_valid_value(
-            normalization_mode, 'normalization_mode',
-            [constants.N2_RECORD, constants.WN_RECORD])
-
-        ind_dict = self.data[subject_id]
-
-        # Unpack data
-        signal = ind_dict[KEY_EEG]
-
-        if normalize_clip:
-            if normalization_mode == constants.WN_RECORD:
-                if verbose:
-                    print('Normalization with stats from '
-                          'pages containing true events.')
-                # Normalize using stats from pages with true events.
-                marks = ind_dict['%s_%d' % (KEY_MARKS, which_expert)]
-                # Transform stamps into sequence
-                marks = utils.stamp2seq(marks, 0, signal.shape[0] - 1)
-                tmp_pages = ind_dict[KEY_ALL_PAGES]
-                activity = utils.extract_pages(
-                    marks, tmp_pages,
-                    self.page_size, border_size=0)
-                activity = activity.sum(axis=1)
-                activity = np.where(activity > 0)[0]
-                tmp_pages = tmp_pages[activity]
-                signal, _ = utils.norm_clip_signal(
-                    signal, tmp_pages, self.page_size,
-                    norm_computation=self.params[pkeys.NORM_COMPUTATION_MODE],
-                    computed_std=self.global_std)
-            else:
-                if verbose:
-                    print('Normalization with stats from '
-                          'N2 pages.')
-                n2_pages = ind_dict[KEY_N2_PAGES]
-                signal, _ = utils.norm_clip_signal(
-                    signal, n2_pages, self.page_size,
-                    norm_computation=self.params[pkeys.NORM_COMPUTATION_MODE],
-                    computed_std=self.global_std)
-        return signal
-
-    def get_subset_signals(
-            self,
-            subject_id_list,
-            normalize_clip=True,
-            normalization_mode=constants.WN_RECORD,
-            which_expert=1,
-            verbose=False
-    ):
-        subset_signals = []
-        for subject_id in subject_id_list:
-            signal = self.get_subject_signal(
-                subject_id,
-                normalize_clip=normalize_clip,
-                normalization_mode=normalization_mode,
-                which_expert=which_expert,
-                verbose=verbose)
-            subset_signals.append(signal)
-        return subset_signals
-
-    def get_signals(
-            self,
-            normalize_clip=True,
-            normalization_mode=constants.WN_RECORD,
-            which_expert=1,
-            verbose=False
-    ):
-        subset_signals = self.get_subset_signals(
-            self.all_ids,
-            normalize_clip=normalize_clip,
-            normalization_mode=normalization_mode,
-            which_expert=which_expert,
-            verbose=verbose)
-        return subset_signals
-
-    def get_ids(self):
-        return self.all_ids
-
-    def get_subject_pages(
-            self,
-            subject_id,
-            pages_subset=constants.WN_RECORD,
-            verbose=False
-    ):
-        """Returns the indices of the pages of this subject."""
-        checks.check_valid_value(subject_id, 'ID', self.all_ids)
-        checks.check_valid_value(
-            pages_subset, 'pages_subset',
-            [constants.N2_RECORD, constants.WN_RECORD])
-
-        ind_dict = self.data[subject_id]
-
-        if pages_subset == constants.WN_RECORD:
-            pages = ind_dict[KEY_ALL_PAGES]
-        else:
-            pages = ind_dict[KEY_N2_PAGES]
-
-        if verbose:
-            print('Getting ID %s, %d %s pages'
-                  % (subject_id, pages.size, pages_subset))
-        return pages
-
-    def get_subset_pages(
-            self,
-            subject_id_list,
-            pages_subset=constants.WN_RECORD,
-            verbose=False
-    ):
-        """Returns the list of pages from a list of subjects."""
-        subset_pages = []
-        for subject_id in subject_id_list:
-            pages = self.get_subject_pages(
-                subject_id,
-                pages_subset=pages_subset,
-                verbose=verbose)
-            subset_pages.append(pages)
-        return subset_pages
-
-    def get_pages(
-            self,
-            pages_subset=constants.WN_RECORD,
-            verbose=False
-    ):
-        """Returns the list of pages from all subjects."""
-        subset_pages = self.get_subset_pages(
-            self.all_ids,
-            pages_subset=pages_subset,
-            verbose=verbose
-        )
-        return subset_pages
-
-    def get_subject_stamps(
-            self,
-            subject_id,
-            which_expert=1,
-            pages_subset=constants.WN_RECORD,
-            verbose=False
-    ):
-        """Returns the sample-stamps of marks of this subject."""
-        checks.check_valid_value(subject_id, 'ID', self.all_ids)
-        valid_experts = [(i + 1) for i in range(self.n_experts)]
-        checks.check_valid_value(which_expert, 'which_expert', valid_experts)
-        checks.check_valid_value(
-            pages_subset, 'pages_subset',
-            [constants.N2_RECORD, constants.WN_RECORD])
-
-        ind_dict = self.data[subject_id]
-
-        marks = ind_dict['%s_%d' % (KEY_MARKS, which_expert)]
-
-        if pages_subset == constants.WN_RECORD:
-            pages = ind_dict[KEY_ALL_PAGES]
-        else:
-            pages = ind_dict[KEY_N2_PAGES]
-
-        # Get stamps that are inside selected pages
-        marks = utils.extract_pages_for_stamps(
-            marks, pages, self.page_size)
-
-        if verbose:
-            print('Getting ID %s, %s pages, %d stamps'
-                  % (subject_id, pages_subset, marks.shape[0]))
-        return marks
-
-    def get_subset_stamps(
-            self,
-            subject_id_list,
-            which_expert=1,
-            pages_subset=constants.WN_RECORD,
-            verbose=False
-    ):
-        """Returns the list of stamps from a list of subjects."""
-        subset_marks = []
-        for subject_id in subject_id_list:
-            marks = self.get_subject_stamps(
-                subject_id,
-                which_expert=which_expert,
-                pages_subset=pages_subset,
-                verbose=verbose)
-            subset_marks.append(marks)
-        return subset_marks
-
-    def get_stamps(
-            self,
-            which_expert=1,
-            pages_subset=constants.WN_RECORD,
-            verbose=False
-    ):
-        """Returns the list of stamps from all subjects."""
-        subset_marks = self.get_subset_stamps(
-            self.all_ids,
-            which_expert=which_expert,
-            pages_subset=pages_subset,
-            verbose=verbose
-        )
-        return subset_marks
-
-    def get_subject_hypnogram(
-            self,
-            subject_id,
-            verbose=False
-    ):
-        """Returns the hypogram of this subject."""
-        checks.check_valid_value(subject_id, 'ID', self.all_ids)
-
-        ind_dict = self.data[subject_id]
-
-        hypno = ind_dict[KEY_HYPNOGRAM]
-
-        if verbose:
-            print('Getting Hypnogram of ID %s' % subject_id)
-        return hypno
-
-    def get_subset_hypnograms(
-            self,
-            subject_id_list,
-            verbose=False
-    ):
-        """Returns the list of hypograms from a list of subjects."""
-        subset_hypnos = []
-        for subject_id in subject_id_list:
-            hypno = self.get_subject_hypnogram(
-                subject_id,
-                verbose=verbose)
-            subset_hypnos.append(hypno)
-        return subset_hypnos
-
-    def get_hypnograms(
-            self,
-            verbose=False
-    ):
-        """Returns the list of hypograms from all subjects."""
-        subset_hypnos = self.get_subset_hypnograms(
-            self.all_ids,
-            verbose=verbose
-        )
-        return subset_hypnos
-
-    def get_subject_data(
-            self,
-            subject_id,
-            augmented_page=False,
-            border_size=0,
-            which_expert=1,
-            pages_subset=constants.WN_RECORD,
-            normalize_clip=True,
-            normalization_mode=constants.WN_RECORD,
-            verbose=False,
-    ):
-        """Returns segments of signal and marks from pages for the given id.
-
-        Args:
-            subject_id: (int) id of the subject of interest.
-            augmented_page: (Optional, boolean, defaults to False) whether to
-                augment the page with half page at each side.
-            border_size: (Optional, int, defaults to 0) number of samples to be
-                added at each border of the segments.
-            which_expert: (Optional, int, defaults to 1) Which expert
-                annotations should be returned. It has to be consistent with
-                the given n_experts, in a one-based counting.
-            pages_subset: (Optional, string, [WN_RECORD, N2_RECORD]) If
-                WN_RECORD (default), pages from the whole record. If N2_RECORD,
-                only N2 pages are returned.
-            normalize_clip: (Optional, boolean, defaults to True) If true,
-                the signal is normalized and clipped from pages statistics.
-            normalization_mode: (Optional, string, [WN_RECORD, N2_RECORD]) If
-                WN_RECORD (default), statistics for normalization are
-                computed from pages containing true events. If N2_RECORD,
-                statistics are computed from N2 pages.
-            verbose: (Optional, boolean, defaults to False) Whether to print
-                what is being read.
-
-        Returns:
-            signal: (2D array) each row is an (augmented) page of the signal
-            marks: (2D array) each row is an (augmented) page of the marks
-        """
-        checks.check_valid_value(subject_id, 'ID', self.all_ids)
-        valid_experts = [(i+1) for i in range(self.n_experts)]
-        checks.check_valid_value(which_expert, 'which_expert', valid_experts)
-        checks.check_valid_value(
-            pages_subset, 'pages_subset',
-            [constants.N2_RECORD, constants.WN_RECORD])
-        checks.check_valid_value(
-            normalization_mode, 'normalization_mode',
-            [constants.N2_RECORD, constants.WN_RECORD])
-
-        ind_dict = self.data[subject_id]
-
-        # Unpack data
-        signal = ind_dict[KEY_EEG]
-        marks = ind_dict['%s_%d' % (KEY_MARKS, which_expert)]
-        if pages_subset == constants.WN_RECORD:
-            pages = ind_dict[KEY_ALL_PAGES]
-        else:
-            pages = ind_dict[KEY_N2_PAGES]
-
-        # Transform stamps into sequence
-        marks = utils.stamp2seq(marks, 0, signal.shape[0] - 1)
-
-        # Compute border to be added
-        if augmented_page:
-            total_border = self.page_size // 2 + border_size
-        else:
-            total_border = border_size
-
-        if normalize_clip:
-            if normalization_mode == constants.WN_RECORD:
-                if verbose:
-                    print('Normalization with stats from '
-                          'pages containing true events.')
-                # Normalize using stats from pages with true events.
-                tmp_pages = ind_dict[KEY_ALL_PAGES]
-                activity = utils.extract_pages(
-                    marks, tmp_pages,
-                    self.page_size, border_size=0)
-                activity = activity.sum(axis=1)
-                activity = np.where(activity > 0)[0]
-                tmp_pages = tmp_pages[activity]
-                signal, _ = utils.norm_clip_signal(
-                    signal, tmp_pages, self.page_size,
-                    norm_computation=self.params[pkeys.NORM_COMPUTATION_MODE],
-                    computed_std=self.global_std)
-            else:
-                if verbose:
-                    print('Normalization with stats from '
-                          'N2 pages.')
-                n2_pages = ind_dict[KEY_N2_PAGES]
-                signal, _ = utils.norm_clip_signal(
-                    signal, n2_pages, self.page_size,
-                    norm_computation=self.params[pkeys.NORM_COMPUTATION_MODE],
-                    computed_std=self.global_std)
-
-        # Extract segments
-        signal = utils.extract_pages(
-            signal, pages, self.page_size, border_size=total_border)
-        marks = utils.extract_pages(
-            marks, pages, self.page_size, border_size=total_border)
-
-        if verbose:
-            print('Getting ID %s, %d %s pages, Expert %d'
-                  % (subject_id, pages.size, pages_subset, which_expert))
-        return signal, marks
-
-    def get_subset_data(
-            self,
-            subject_id_list,
-            augmented_page=False,
-            border_size=0,
-            which_expert=1,
-            pages_subset=constants.WN_RECORD,
-            normalize_clip=True,
-            normalization_mode=constants.WN_RECORD,
-            verbose=False,
-    ):
-        """Returns the list of signals and marks from a list of subjects.
-        """
-        subset_signals = []
-        subset_marks = []
-        for subject_id in subject_id_list:
-            signal, marks = self.get_subject_data(
-                subject_id,
-                augmented_page=augmented_page,
-                border_size=border_size,
-                which_expert=which_expert,
-                pages_subset=pages_subset,
-                normalize_clip=normalize_clip,
-                normalization_mode=normalization_mode,
-                verbose=verbose,
-            )
-            subset_signals.append(signal)
-            subset_marks.append(marks)
-        return subset_signals, subset_marks
-
-    def get_data(
-            self,
-            augmented_page=False,
-            border_size=0,
-            which_expert=1,
-            pages_subset=constants.WN_RECORD,
-            normalize_clip=True,
-            normalization_mode=constants.WN_RECORD,
-            verbose=False
-    ):
-        """Returns the list of signals and marks from all subjects.
-        """
-        subset_signals, subset_marks = self.get_subset_data(
-            self.all_ids,
-            augmented_page=augmented_page,
-            border_size=border_size,
-            which_expert=which_expert,
-            pages_subset=pages_subset,
-            normalize_clip=normalize_clip,
-            normalization_mode=normalization_mode,
-            verbose=verbose
-        )
-        return subset_signals, subset_marks
-
-    def get_sub_dataset(self, subject_id_list):
-        """Data structure of a subset of subjects"""
-        data_subset = {}
-        for pat_id in subject_id_list:
-            data_subset[pat_id] = self.data[pat_id].copy()
-        return data_subset
 
     def save_checkpoint(self):
         """Saves a pickle file containing the loaded data."""
@@ -596,32 +143,34 @@ class Mass(object):
             path_dict = data_paths[subject_id]
 
             # Read data
-            signal = self._read_eeg(
-                path_dict[KEY_FILE_EEG])
-            signal_len = signal.shape[0]
+            signal_eeg_frontal = self._read_eeg(
+                path_dict[KEY_FILE_EEG], KEY_EEG_FRONTAL)
+            signal_eeg_central = self._read_eeg(
+                path_dict[KEY_FILE_EEG], KEY_EEG_CENTRAL)
+            signal_eeg_occipital = self._read_eeg(
+                path_dict[KEY_FILE_EEG], KEY_EEG_OCCIPITAL)
 
-            n2_pages, hypnogram = self._read_states(
+            signal_eog_left = self._read_eeg(
+                path_dict[KEY_FILE_EEG], KEY_EOG_LEFT)
+            signal_eog_right = self._read_eeg(
+                path_dict[KEY_FILE_EEG], KEY_EOG_RIGHT)
+
+            signal_emg = self._read_eeg(
+                path_dict[KEY_FILE_EEG], KEY_EMG)
+
+            signal_len = signal_eeg_frontal.shape[0]
+            hypnogram = self._read_states(
                 path_dict[KEY_FILE_STATES], signal_len)
-            total_pages = int(np.ceil(signal_len / self.page_size))
-            all_pages = np.arange(1, total_pages - 2, dtype=np.int16)
-            print('N2 pages: %d' % n2_pages.shape[0])
-            print('Whole-night pages: %d' % all_pages.shape[0])
             print('Hypnogram pages: %d' % hypnogram.shape[0])
-
-            marks_1 = self._read_marks(
-                path_dict['%s_1' % KEY_FILE_MARKS])
-            marks_2 = self._read_marks(
-                path_dict['%s_2' % KEY_FILE_MARKS])
-            print('Marks SS from E1: %d, Marks SS from E2: %d'
-                  % (marks_1.shape[0], marks_2.shape[0]))
 
             # Save data
             ind_dict = {
-                KEY_EEG: signal,
-                KEY_N2_PAGES: n2_pages,
-                KEY_ALL_PAGES: all_pages,
-                '%s_1' % KEY_MARKS: marks_1,
-                '%s_2' % KEY_MARKS: marks_2,
+                KEY_EEG_FRONTAL: signal_eeg_frontal,
+                KEY_EEG_CENTRAL: signal_eeg_central,
+                KEY_EEG_OCCIPITAL: signal_eeg_occipital,
+                KEY_EOG_LEFT: signal_eog_left,
+                KEY_EOG_RIGHT: signal_eog_right,
+                KEY_EMG: signal_emg,
                 KEY_HYPNOGRAM: hypnogram
             }
             data[subject_id] = ind_dict
@@ -641,18 +190,10 @@ class Mass(object):
             path_states_file = os.path.join(
                 self.dataset_dir, PATH_STATES,
                 '01-02-%04d Base.edf' % subject_id)
-            path_marks_1_file = os.path.join(
-                self.dataset_dir, PATH_MARKS,
-                '01-02-%04d SpindleE1.edf' % subject_id)
-            path_marks_2_file = os.path.join(
-                self.dataset_dir, PATH_MARKS,
-                '01-02-%04d SpindleE2.edf' % subject_id)
             # Save paths
             ind_dict = {
                 KEY_FILE_EEG: path_eeg_file,
-                KEY_FILE_STATES: path_states_file,
-                '%s_1' % KEY_FILE_MARKS: path_marks_1_file,
-                '%s_2' % KEY_FILE_MARKS: path_marks_2_file
+                KEY_FILE_STATES: path_states_file
             }
             # Check paths
             for key in ind_dict:
@@ -664,54 +205,42 @@ class Mass(object):
         print('Subject IDs: %s' % self.all_ids)
         return data_paths
 
-    def _read_eeg(self, path_eeg_file):
+    def _read_eeg(self, path_eeg_file, channel_name):
         """Loads signal from 'path_eeg_file', does filtering and resampling."""
+        proper_name_dict = {
+            KEY_EEG_FRONTAL: 'EEG F3-CLE',  # Frontal
+            KEY_EEG_CENTRAL: 'EEG C3-CLE',  # Central
+            KEY_EEG_OCCIPITAL: 'EEG O1-CLE',  # Occipital
+            KEY_EMG: 'EMG Chin',  # EMG
+            KEY_EOG_LEFT: 'EOG Left Horiz',  # Left eye
+            KEY_EOG_RIGHT: 'EOG Right Horiz',  # Right eye
+        }
+
+        checks.check_valid_value(
+            channel_name, 'channel_name', list(proper_name_dict.keys()))
+
         with pyedflib.EdfReader(path_eeg_file) as file:
             channel_names = file.getSignalLabels()
-            channel_to_extract = channel_names.index(self.channel)
+            channel_to_extract = channel_names.index(
+                proper_name_dict[channel_name])
             signal = file.readSignal(channel_to_extract)
             fs_old = file.samplefrequency(channel_to_extract)
             # Check
             print('Channel extracted: %s' % file.getLabel(channel_to_extract))
-
         fs_old_round = int(np.round(fs_old))
         # Transform the original fs frequency with decimals to rounded version
         signal = utils.resample_signal_linear(
             signal, fs_old=fs_old, fs_new=fs_old_round)
-        # Broand bandpass filter to signal
-        signal = utils.broad_filter(signal, fs_old)
-        # Now resample to the required frequency
-        signal = utils.resample_signal(
-            signal, fs_old=fs_old_round, fs_new=self.fs)
         signal = signal.astype(np.float32)
         return signal
-
-    def _read_marks(self, path_marks_file):
-        """Loads data spindle annotations from 'path_marks_file'.
-        Marks with a duration outside feasible boundaries are removed.
-        Returns the sample-stamps of each mark."""
-        with pyedflib.EdfReader(path_marks_file) as file:
-            annotations = file.readAnnotations()
-        onsets = np.array(annotations[0])
-        durations = np.array(annotations[1])
-        offsets = onsets + durations
-        marks_time = np.stack((onsets, offsets), axis=1)  # time-stamps
-        # Transforms to sample-stamps
-        marks = np.round(marks_time * self.fs).astype(np.int32)
-        # Combine marks that are too close according to standards
-        marks = stamp_correction.combine_close_stamps(
-            marks, self.fs, self.min_ss_duration)
-        # Fix durations that are outside standards
-        marks = stamp_correction.filter_duration_stamps(
-            marks, self.fs, self.min_ss_duration, self.max_ss_duration)
-        return marks
 
     def _read_states(self, path_states_file, signal_length):
         """Loads hypnogram from 'path_states_file'. Only n2 pages are returned.
         First, last and second to last pages of the hypnogram are ignored, since
         there is no enough context."""
         # Total pages not necessarily equal to total_annots
-        total_pages = int(np.ceil(signal_length / self.page_size))
+        page_size = self.fs * self.page_duration
+        total_pages = int(np.ceil(signal_length / page_size)) - 1
 
         with pyedflib.EdfReader(path_states_file) as file:
             annotations = file.readAnnotations()
@@ -729,34 +258,211 @@ class Mass(object):
         # Build complete hypnogram
         total_annots = len(stages_char)
 
-        not_unkown_ids = [
-            state_id for state_id in self.state_ids
-            if state_id != self.unknown_id]
-        not_unkown_state_dict = {}
-        for state_id in not_unkown_ids:
+        state_ids = np.array(['1', '2', '3', '4', 'R', 'W', '?'])
+        correct_id_dict = {
+            '1': 'N1',
+            '2': 'N2',
+            '3': 'N3',
+            '4': 'N3',
+            'R': 'R',
+            'W': 'W',
+            '?': '?'
+        }
+        unknown_id = '?'  # Character for unknown state in hypnogram
+
+        not_unknown_ids = [
+            state_id for state_id in state_ids
+            if state_id != unknown_id]
+        not_unknown_state_dict = {}
+        for state_id in not_unknown_ids:
             state_idx = np.where(
                 [stages_char[i] == state_id for i in range(total_annots)])[0]
-            not_unkown_state_dict[state_id] = onsets_pages[state_idx]
+            not_unknown_state_dict[state_id] = onsets_pages[state_idx]
+
         hypnogram = []
         for page in range(total_pages):
             state_not_found = True
-            for state_id in not_unkown_ids:
-                if page in not_unkown_state_dict[state_id] and state_not_found:
-                    hypnogram.append(state_id)
+            for state_id in not_unknown_ids:
+                if page in not_unknown_state_dict[state_id] and state_not_found:
+                    hypnogram.append(correct_id_dict[state_id])
                     state_not_found = False
             if state_not_found:
-                hypnogram.append(self.unknown_id)
+                hypnogram.append(unknown_id)
         hypnogram = np.asarray(hypnogram)
 
-        # Extract N2 pages
-        n2_pages = np.where(hypnogram == self.n2_id)[0]
-        # Drop first, last and second to last page of the whole registers
-        # if they where selected.
-        last_page = total_pages - 1
-        n2_pages = n2_pages[
-            (n2_pages != 0)
-            & (n2_pages != last_page)
-            & (n2_pages != last_page - 1)]
-        n2_pages = n2_pages.astype(np.int16)
+        return hypnogram
 
-        return n2_pages, hypnogram
+    def get_ids(self):
+        return self.all_ids
+
+    def get_train_ids(self):
+        return self.train_ids
+
+    def get_test_ids(self):
+        return self.test_ids
+
+    def get_signal_names(self):
+        names = [
+            KEY_EEG_FRONTAL,
+            KEY_EEG_CENTRAL,
+            KEY_EEG_OCCIPITAL,
+            KEY_EOG_LEFT,
+            KEY_EOG_RIGHT,
+            KEY_EMG
+        ]
+        return names
+
+    def get_subject_signal(self, subject_id, verbose=False):
+        checks.check_valid_value(subject_id, 'ID', self.all_ids)
+        ind_dict = self.data[subject_id]
+        signal = np.stack(
+            [
+                ind_dict[KEY_EEG_FRONTAL],
+                ind_dict[KEY_EEG_CENTRAL],
+                ind_dict[KEY_EEG_OCCIPITAL],
+                ind_dict[KEY_EOG_LEFT],
+                ind_dict[KEY_EOG_RIGHT],
+                ind_dict[KEY_EMG]
+            ],
+            axis=1)
+        if verbose:
+            print('Getting signal of ID %s' % subject_id)
+        return signal
+
+    def get_subset_signals(self, subject_id_list, verbose=False):
+        subset_signals = []
+        for subject_id in subject_id_list:
+            signal = self.get_subject_signal(
+                subject_id, verbose=verbose)
+            subset_signals.append(signal)
+        return subset_signals
+
+    def get_signals(self, verbose=False):
+        subset_signals = self.get_subset_signals(
+            self.all_ids, verbose=verbose)
+        return subset_signals
+
+    def get_subject_hypnogram(self, subject_id, verbose=False):
+        """Returns the hypogram of this subject."""
+        checks.check_valid_value(subject_id, 'ID', self.all_ids)
+
+        ind_dict = self.data[subject_id]
+        hypno = ind_dict[KEY_HYPNOGRAM]
+        if verbose:
+            print('Getting Hypnogram of ID %s' % subject_id)
+        return hypno
+
+    def get_subset_hypnograms(self, subject_id_list, verbose=False):
+        """Returns the list of hypograms from a list of subjects."""
+        subset_hypnos = []
+        for subject_id in subject_id_list:
+            hypno = self.get_subject_hypnogram(
+                subject_id,
+                verbose=verbose)
+            subset_hypnos.append(hypno)
+        return subset_hypnos
+
+    def get_hypnograms(self, verbose=False):
+        """Returns the list of hypograms from all subjects."""
+        subset_hypnos = self.get_subset_hypnograms(
+            self.all_ids,
+            verbose=verbose)
+        return subset_hypnos
+
+    def get_subject_data(
+            self,
+            subject_id,
+            output_fs=100,
+            border_duration=0,
+            ignore_unknown=True,
+            verbose=False):
+        """
+        Returns segments of the signals for the given id and their
+        corresponding sleep stage.
+        """
+        checks.check_valid_value(subject_id, 'ID', self.all_ids)
+        if output_fs > self.fs:
+            raise ValueError('output fs cannot be greater than original fs')
+
+        signal = self.get_subject_signal(subject_id)
+        hypnogram = self.get_subject_hypnogram(subject_id)
+
+        # Resample if needed
+        if output_fs < self.fs:
+            if verbose:
+                print('Resampling from %d Hz to %d Hz' % (self.fs, output_fs))
+            resampled_list = []
+            for chn in range(signal.shape[1]):
+                this_signal = signal[:, chn]
+                this_signal = utils.resample_signal(
+                    this_signal, self.fs, output_fs)
+                resampled_list.append(this_signal)
+            signal = np.stack(resampled_list, axis=1)
+
+        # Extract segments
+        segments_list = []
+        stages_list = []
+        page_size = int(self.page_duration * output_fs)
+        border_size = int(border_duration * output_fs)
+        for i, stage in enumerate(hypnogram):
+            if i == 0:
+                if verbose:
+                    "Skipping first segment."
+            elif stage == "?" and ignore_unknown:
+                if verbose:
+                    "Dropped unknown stage '?'."
+            else:
+                sample_start = i * page_size - border_size
+                sample_end = (i + 1) * page_size + border_size
+                this_segment = signal[sample_start:sample_end, :]
+                segments_list.append(this_segment)
+                stages_list.append(stage)
+
+        x = np.stack(segments_list, axis=0)
+        y = np.stack(stages_list, axis=0)
+
+        if verbose:
+            print('S%02d with %d segments' % (subject_id, x.shape[0]))
+
+        return x, y
+
+    def get_subset_data(
+            self,
+            subject_id_list,
+            output_fs=100,
+            border_duration=0,
+            ignore_unknown=True,
+            verbose=False
+    ):
+        """Returns the list of signals and marks from a list of subjects.
+        """
+        subset_signals = []
+        subset_stages = []
+        for subject_id in subject_id_list:
+            signal, stages = self.get_subject_data(
+                subject_id,
+                output_fs=output_fs,
+                border_duration=border_duration,
+                ignore_unknown=ignore_unknown,
+                verbose=verbose)
+            subset_signals.append(signal)
+            subset_stages.append(stages)
+        return subset_signals, subset_stages
+
+    def get_data(
+            self,
+            output_fs=100,
+            border_duration=0,
+            ignore_unknown=True,
+            verbose=False
+    ):
+        """Returns the list of signals and marks from all subjects.
+        """
+        subset_signals, subset_stages = self.get_subset_data(
+            self.all_ids,
+            output_fs=output_fs,
+            border_duration=border_duration,
+            ignore_unknown=ignore_unknown,
+            verbose=verbose)
+        return subset_signals, subset_stages
+
