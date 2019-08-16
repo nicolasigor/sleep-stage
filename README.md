@@ -6,4 +6,12 @@ This is a toy example of sleep stage scoring with simple features and a Random F
 
 Access to the database should be properly requested following the instructions at http://massdb.herokuapp.com/en/get-access/
 
+Requirements:
+- Numpy
+- Matplotlib
+- Scikit-learn
+- Scipy
+- Pyedflib
+
+
 [1] O’Reilly, C., Gosselin, N., Carrier, J. & Nielsen, T. (2014) Montreal Archive of Sleep Studies: An open-access resource for instrument benchmarking & exploratory research. Journal of Seep Research, 628-635. doi: 10.1111/jsr.12169 .
