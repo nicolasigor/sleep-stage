@@ -2,9 +2,9 @@
 
 This repository was made for the course EL7006 Neural Networks and Information Theory for Learning, Universidad de Chile, with educational purposes.
 
-This is a toy example of sleep stage scoring with simple features and a Random Forest classifier, using sleep data from the MASS Database [1] (not included in this repository). Scripts of visualization and classification can be found inside the 'scripts' directory.  It is meant to be a working example for the input pipeline of the classification task needed for course projects.
+This is a toy example of sleep stage scoring with simple features and a Random Forest classifier, using sleep data from the MASS Database [1] (not included in this repository). Scripts for visualization and classification can be found inside the 'scripts' directory.  It is meant to be a working example for the input pipeline of the classification task needed for course projects.
 
-Access to the database should be properly requested following the instructions at http://massdb.herokuapp.com/en/get-access/
+Access to the database should be properly requested following the instructions at http://ceams-carsm.ca/en/mass
 
 Requirements:
 - Numpy
